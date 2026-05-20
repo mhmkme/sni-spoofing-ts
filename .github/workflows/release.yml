@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     strategy:
@@ -16,18 +20,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: sni-spoof-rs-linux-amd64
+            ui_name: sni-spoof-rs-ui-linux-amd64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             name: sni-spoof-rs-linux-arm64
+            ui_name: ""
           - target: x86_64-apple-darwin
             os: macos-latest
             name: sni-spoof-rs-macos-amd64
+            ui_name: sni-spoof-rs-ui-macos-amd64
           - target: aarch64-apple-darwin
             os: macos-latest
             name: sni-spoof-rs-macos-arm64
+            ui_name: sni-spoof-rs-ui-macos-arm64
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: sni-spoof-rs-windows-amd64
+            ui_name: sni-spoof-rs-ui-windows-amd64
 
     runs-on: ${{ matrix.os }}
 
@@ -55,6 +64,15 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
+      - name: Install Linux UI dependencies
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxi-dev libgl1-mesa-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev
+
       - name: Configure GNU linker
         if: matrix.target == 'x86_64-pc-windows-gnu'
         shell: pwsh
@@ -67,12 +85,20 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Build UI
+        if: matrix.ui_name != ''
+        run: cargo build --release --target ${{ matrix.target }} --features ui --bin sni-spoof-rs-ui
+
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sni-spoof-rs dist/${{ matrix.name }}
           chmod +x dist/${{ matrix.name }}
+          if [ -n "${{ matrix.ui_name }}" ]; then
+            cp target/${{ matrix.target }}/release/sni-spoof-rs-ui dist/${{ matrix.ui_name }}
+            chmod +x dist/${{ matrix.ui_name }}
+          fi
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -80,6 +106,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.name }}
           Copy-Item target/${{ matrix.target }}/release/sni-spoof-rs.exe dist/${{ matrix.name }}/
+          Copy-Item target/${{ matrix.target }}/release/sni-spoof-rs-ui.exe dist/${{ matrix.name }}/
           $sysFile = Get-ChildItem -Recurse -Path target -Filter "WinDivert64.sys" | Select-Object -First 1
           $dllFile = Get-ChildItem -Recurse -Path target -Filter "WinDivert.dll" | Select-Object -First 1
           if ($sysFile -and $dllFile) {
@@ -97,7 +124,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/${{ matrix.name }}${{ runner.os == 'Windows' && '.zip' || '' }}
+          path: dist/*
 
   release:
     needs: build
@@ -117,8 +144,10 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ github.ref_name }}
           files: dist/*
           generate_release_notes: true
+          make_latest: true
 
       - name: Commit binaries to releases/ folder
         run: |
@@ -128,12 +157,16 @@ jobs:
           cp dist/sni-spoof-rs-macos-amd64 releases/
           cp dist/sni-spoof-rs-macos-arm64 releases/
           cp dist/sni-spoof-rs-windows-amd64.zip releases/
+          cp dist/sni-spoof-rs-ui-linux-amd64 releases/ || true
+          cp dist/sni-spoof-rs-ui-macos-amd64 releases/ || true
+          cp dist/sni-spoof-rs-ui-macos-arm64 releases/ || true
           chmod +x releases/sni-spoof-rs-linux-* releases/sni-spoof-rs-macos-*
+          chmod +x releases/sni-spoof-rs-ui-* || true
           TAG="${GITHUB_REF#refs/tags/}"
           sed -i "s/Current version: \*\*v[0-9.]*\*\*/Current version: **${TAG}**/" releases/README.md || true
           sed -i "s/نسخه فعلی: \*\*v[0-9.]*\*\*/نسخه فعلی: **${TAG}**/" releases/README.md || true
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "therealaleph"
+          git config user.email "therealaleph@gmail.com"
           git add releases/
           if ! git diff --cached --quiet; then
             git commit -m "chore: update prebuilt binaries to ${TAG}"
