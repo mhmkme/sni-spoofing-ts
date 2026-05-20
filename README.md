@@ -19,9 +19,13 @@ sni-spoof-rs is a local TCP forwarder and desktop helper for Cloudflare-fronted 
 - Native CLI proxy for Linux, macOS, and Windows.
 - Native desktop UI for Linux, macOS, and Windows.
 - Built-in Xray launcher for VLESS and Trojan links.
+- Bundled UI packages that include the matching Xray binary next to the app.
 - HTTP/HTTPS proxy on `127.0.0.1:1080` and SOCKS5 proxy on `127.0.0.1:1081`.
 - LAN sharing mode using `0.0.0.0` so phones or other devices on the same trusted network can use the connection.
 - Built-in fake-SNI scanner for finding domains that still pass on your ISP.
+- Public IP check through the local proxy, so the UI can show whether the tunnel is actually working.
+- Optional log persistence toggle for users who do not want logs written to the UI state file.
+- Experimental Xray TUN inbound mode for elevated desktop runs.
 - Docker image for running one shared proxy box for a local network.
 - GitHub Actions release builds for Linux, macOS, Windows, and GHCR Docker images.
 
@@ -55,7 +59,10 @@ The release assets include:
 | `sni-spoof-rs-ui-linux-amd64` | Linux x86_64 desktop UI |
 | `sni-spoof-rs-ui-macos-amd64` | macOS Intel desktop UI |
 | `sni-spoof-rs-ui-macos-arm64` | macOS Apple Silicon desktop UI |
-| `sni-spoof-rs-windows-amd64.zip` | Windows CLI, UI, and WinDivert files |
+| `sni-spoof-rs-ui-linux-amd64-bundle.tar.gz` | Linux x86_64 desktop UI plus Xray |
+| `sni-spoof-rs-ui-macos-amd64-bundle.tar.gz` | macOS Intel desktop UI plus Xray |
+| `sni-spoof-rs-ui-macos-arm64-bundle.tar.gz` | macOS Apple Silicon desktop UI plus Xray |
+| `sni-spoof-rs-windows-amd64.zip` | Windows CLI, UI, Xray, and WinDivert files |
 
 ### Fastest Path: Desktop UI
 
@@ -77,10 +84,15 @@ In the UI:
 5. Configure your browser or app:
    - HTTP/HTTPS proxy: `127.0.0.1:1080`
    - SOCKS5 proxy: `127.0.0.1:1081`
+6. Press **Fetch my IP** or **Check IP** to verify that traffic exits through the local proxy.
 
 If your pasted link already points to `127.0.0.1:40443`, the UI accepts it and resolves the real upstream from `host=` or `sni=`. This matches links generated for other local proxy apps.
 
-The UI saves form values, imported links, selected config, theme, scanner settings, and recent logs in `sni-spoof-rs-ui-state.json` next to the executable. Set `SNI_SPOOF_UI_STATE=/path/to/state.json` to use another location. Logs are persistent and can be exported from the Logs panel.
+If you use a `*-bundle.tar.gz` UI package or the Windows zip, keep `xray`/`xray.exe` beside the UI executable; the app will discover it automatically. The **Download Xray** button installs Xray into a persistent app data folder and updates `xray_binary`, so it stays available after restart instead of living in a temporary directory.
+
+The UI saves form values, imported links, selected config, theme, scanner settings, and recent logs in `sni-spoof-rs-ui-state.json` next to the executable. Set `SNI_SPOOF_UI_STATE=/path/to/state.json` to use another location. Logs are persistent and can be exported from the Logs panel. Turn off **Logging** in the Logs panel if you do not want new logs kept in memory or written to the state file.
+
+The **Xray TUN mode** checkbox adds an experimental Xray TUN inbound. Run elevated, keep HTTP/SOCKS enabled while testing, and watch for routing loops if another VPN/TUN client is already active.
 
 ### Sharing With Other Devices
 
@@ -272,10 +284,14 @@ sni-spoof-rs یک ابزار Rust برای دور زدن DPI مبتنی بر SNI
 - نسخه CLI برای Linux، macOS و Windows.
 - رابط گرافیکی دسکتاپ برای Linux، macOS و Windows.
 - اجرای داخلی Xray برای لینک‌های VLESS و Trojan.
+- بسته‌های UI آماده که Xray مناسب همان سیستم را کنار برنامه دارند.
 - پروکسی HTTP/HTTPS روی `127.0.0.1:1080`.
 - پروکسی SOCKS5 روی `127.0.0.1:1081`.
 - حالت اشتراک در شبکه محلی با `0.0.0.0` برای استفاده گوشی یا دستگاه‌های دیگر.
 - اسکنر داخلی برای پیدا کردن `fake_sni` قابل استفاده روی ISP شما.
+- چک کردن IP عمومی از داخل پروکسی برای فهمیدن اینکه اتصال واقعا برقرار شده یا نه.
+- امکان خاموش کردن ذخیره لاگ برای کسانی که نمی‌خواهند لاگ در فایل state نوشته شود.
+- حالت آزمایشی Xray TUN برای اجرای دسکتاپ با دسترسی بالا.
 - نسخه Docker برای راه‌اندازی یک پروکسی مشترک روی یک سیستم.
 - ساخت خودکار فایل‌های Release و Docker image با GitHub Actions.
 
@@ -309,7 +325,10 @@ sni-spoof-rs یک ابزار Rust برای دور زدن DPI مبتنی بر SNI
 | `sni-spoof-rs-ui-linux-amd64` | رابط گرافیکی لینوکس x86_64 |
 | `sni-spoof-rs-ui-macos-amd64` | رابط گرافیکی مک Intel |
 | `sni-spoof-rs-ui-macos-arm64` | رابط گرافیکی مک Apple Silicon |
-| `sni-spoof-rs-windows-amd64.zip` | نسخه ویندوز شامل CLI، UI و WinDivert |
+| `sni-spoof-rs-ui-linux-amd64-bundle.tar.gz` | رابط گرافیکی لینوکس x86_64 همراه Xray |
+| `sni-spoof-rs-ui-macos-amd64-bundle.tar.gz` | رابط گرافیکی مک Intel همراه Xray |
+| `sni-spoof-rs-ui-macos-arm64-bundle.tar.gz` | رابط گرافیکی مک Apple Silicon همراه Xray |
+| `sni-spoof-rs-windows-amd64.zip` | نسخه ویندوز شامل CLI، UI، Xray و WinDivert |
 
 ### راه سریع: رابط گرافیکی
 
@@ -331,10 +350,15 @@ sudo ./target/release/sni-spoof-rs-ui
 5. در مرورگر یا اپ خود پروکسی را تنظیم کنید:
    - HTTP/HTTPS: `127.0.0.1:1080`
    - SOCKS5: `127.0.0.1:1081`
+6. با **Fetch my IP** یا **Check IP** بررسی کنید که خروجی اینترنت از همین پروکسی انجام می‌شود.
 
 اگر لینک شما از قبل به `127.0.0.1:40443` اشاره می‌کند، UI آن را قبول می‌کند و مقصد واقعی را از `host=` یا `sni=` پیدا می‌کند.
 
-UI تنظیمات فرم، لینک‌های وارد شده، کانفیگ انتخاب شده، تم، تنظیمات اسکنر و لاگ‌های اخیر را در فایل `sni-spoof-rs-ui-state.json` کنار برنامه ذخیره می‌کند. برای تغییر مسیر ذخیره‌سازی، متغیر `SNI_SPOOF_UI_STATE=/path/to/state.json` را تنظیم کنید. لاگ‌ها ماندگار هستند و از پنل Logs قابل خروجی گرفتن هستند.
+اگر بسته‌های `*-bundle.tar.gz` یا zip ویندوز را استفاده کنید، فایل `xray` یا `xray.exe` کنار برنامه قرار دارد و UI آن را خودکار پیدا می‌کند. دکمه **Download Xray** هم Xray را در پوشه دائمی داده‌های برنامه نصب می‌کند و مسیر `xray_binary` را تنظیم می‌کند؛ بنابراین بعد از ری‌استارت هم باقی می‌ماند.
+
+UI تنظیمات فرم، لینک‌های وارد شده، کانفیگ انتخاب شده، تم، تنظیمات اسکنر و لاگ‌های اخیر را در فایل `sni-spoof-rs-ui-state.json` کنار برنامه ذخیره می‌کند. برای تغییر مسیر ذخیره‌سازی، متغیر `SNI_SPOOF_UI_STATE=/path/to/state.json` را تنظیم کنید. لاگ‌ها ماندگار هستند و از پنل Logs قابل خروجی گرفتن هستند. اگر نمی‌خواهید لاگ جدید در حافظه یا فایل state ذخیره شود، گزینه **Logging** را در پنل Logs خاموش کنید.
+
+گزینه **Xray TUN mode** یک inbound آزمایشی TUN به Xray اضافه می‌کند. برنامه را با دسترسی بالا اجرا کنید، هنگام تست HTTP/SOCKS را هم روشن نگه دارید، و اگر VPN/TUN دیگری فعال است مراقب loop شدن routeها باشید.
 
 ### استفاده برای دستگاه‌های دیگر شبکه
 
@@ -491,7 +515,7 @@ make all
 make ui
 ```
 
-با push کردن tag مثل `v1.0.0`، GitHub Actions فایل‌های Linux/macOS/Windows را می‌سازد، Release می‌سازد، فایل‌ها را به Release اضافه می‌کند و Docker image را هم در GHCR منتشر می‌کند.
+با push کردن tag مثل `v1.0.1`، GitHub Actions فایل‌های Linux/macOS/Windows را می‌سازد، Release می‌سازد، فایل‌ها را به Release اضافه می‌کند و Docker image را هم در GHCR منتشر می‌کند.
 
 ## License
 

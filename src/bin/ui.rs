@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,6 +64,7 @@ fn main() -> eframe::Result<()> {
 struct UiLog {
     lines: Arc<Mutex<VecDeque<String>>>,
     revision: Arc<AtomicU64>,
+    enabled: Arc<AtomicBool>,
 }
 
 impl Default for UiLog {
@@ -71,12 +72,16 @@ impl Default for UiLog {
         Self {
             lines: Arc::new(Mutex::new(VecDeque::new())),
             revision: Arc::new(AtomicU64::new(0)),
+            enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 }
 
 impl UiLog {
     fn push(&self, line: impl Into<String>) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         let mut lines = self.lines.lock().unwrap();
         lines.push_back(line.into());
         while lines.len() > LOG_MAX {
@@ -99,6 +104,13 @@ impl UiLog {
     fn clear(&self) {
         self.lines.lock().unwrap().clear();
         self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.clear();
+        }
     }
 
     fn revision(&self) -> u64 {
@@ -299,8 +311,12 @@ struct App {
     xray_path: String,
     xray_http_listen: String,
     xray_socks_listen: String,
+    xray_tun_enabled: bool,
     xray_log_level: String,
     xray_rx: Option<Receiver<XrayMsg>>,
+    ip_check_rx: Option<Receiver<IpCheckMsg>>,
+    connection_status: ConnectionStatus,
+    logging_enabled: bool,
     light_mode: bool,
     scan_target: String,
     scan_timeout_secs: String,
@@ -318,8 +334,15 @@ struct App {
 impl App {
     fn new(log: UiLog) -> Self {
         let saved = load_ui_state();
-        if let Some(state) = &saved {
-            log.restore(state.log_lines.clone());
+        let logging_enabled = saved
+            .as_ref()
+            .map(|state| state.logging_enabled)
+            .unwrap_or(true);
+        log.set_enabled(logging_enabled);
+        if logging_enabled {
+            if let Some(state) = &saved {
+                log.restore(state.log_lines.clone());
+            }
         }
         let cfg = config::load("config.json").unwrap_or_default();
         let form = saved
@@ -329,7 +352,10 @@ impl App {
         let xray_path = saved
             .as_ref()
             .map(|state| state.xray_path.clone())
-            .filter(|path| !path.trim().is_empty())
+            .filter(|path| {
+                let trimmed = path.trim();
+                !trimmed.is_empty() && Path::new(trimmed).exists()
+            })
             .unwrap_or_else(default_xray_path);
         let scan_target = saved
             .as_ref()
@@ -363,12 +389,19 @@ impl App {
                 .and_then(|state| state.xray_socks_listen.clone())
                 .filter(|listen| !listen.trim().is_empty())
                 .unwrap_or_else(|| "127.0.0.1:1081".into()),
+            xray_tun_enabled: saved
+                .as_ref()
+                .map(|state| state.xray_tun_enabled)
+                .unwrap_or(false),
             xray_log_level: saved
                 .as_ref()
                 .map(|state| state.xray_log_level.clone())
                 .filter(|level| !level.trim().is_empty())
                 .unwrap_or_else(|| "warning".into()),
             xray_rx: None,
+            ip_check_rx: None,
+            connection_status: ConnectionStatus::Idle,
+            logging_enabled,
             light_mode: saved.as_ref().map(|state| state.light_mode).unwrap_or(true),
             scan_timeout_secs: saved
                 .as_ref()
@@ -472,6 +505,31 @@ impl App {
         }
     }
 
+    fn poll_ip_check(&mut self) {
+        if let Some(rx) = &self.ip_check_rx {
+            match rx.try_recv() {
+                Ok(IpCheckMsg::Checked(Ok(ip))) => {
+                    self.connection_status = ConnectionStatus::Connected(ip.clone());
+                    self.status = format!("Connected. Public IP via proxy: {}", ip);
+                    self.log
+                        .push(format!("connection check ok; public IP {}", ip));
+                    self.ip_check_rx = None;
+                }
+                Ok(IpCheckMsg::Checked(Err(e))) => {
+                    self.connection_status = ConnectionStatus::Failed(e.clone());
+                    self.status = format!("Connection check failed: {}", e);
+                    self.log.push(format!("connection check failed: {}", e));
+                    self.ip_check_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.connection_status = ConnectionStatus::Failed("checker stopped".into());
+                    self.ip_check_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     fn start_proxy(&mut self) -> bool {
         if self.proxy.is_some() {
             return true;
@@ -498,6 +556,7 @@ impl App {
             proxy.stop();
             self.status = "Proxy stopped".into();
             self.log.push("proxy stopped from UI");
+            self.reset_connection_status();
         }
     }
 
@@ -529,6 +588,7 @@ impl App {
             &self.form.listen,
             &self.xray_http_listen,
             &self.xray_socks_listen,
+            self.xray_tun_enabled,
             &self.xray_log_level,
         ) {
             Ok(config) => config,
@@ -583,6 +643,9 @@ impl App {
             self.xray_http_listen, self.xray_socks_listen
         ));
         self.xray = Some(XrayRuntime { child, config_path });
+        if self.proxy.is_some() {
+            self.start_ip_check();
+        }
         true
     }
 
@@ -591,7 +654,39 @@ impl App {
             xray.stop();
             self.status = "Xray stopped".into();
             self.log.push("xray stopped from UI");
+            self.reset_connection_status();
         }
+    }
+
+    fn start_ip_check(&mut self) {
+        if self.ip_check_rx.is_some() {
+            return;
+        }
+        let proxy_url =
+            match connection_check_proxy_url(&self.xray_http_listen, &self.xray_socks_listen) {
+                Ok(proxy_url) => proxy_url,
+                Err(e) => {
+                    self.connection_status = ConnectionStatus::Failed(e.clone());
+                    self.status = format!("Connection check failed: {}", e);
+                    return;
+                }
+            };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ip_check_rx = Some(rx);
+        self.connection_status = ConnectionStatus::Checking;
+        self.status = "Checking public IP through Xray proxy...".into();
+        self.log
+            .push(format!("checking public IP through {}", proxy_url));
+        std::thread::spawn(move || {
+            let result = fetch_public_ip_through_proxy(&proxy_url);
+            let _ = tx.send(IpCheckMsg::Checked(result));
+        });
+    }
+
+    fn reset_connection_status(&mut self) {
+        self.ip_check_rx = None;
+        self.connection_status = ConnectionStatus::Idle;
     }
 
     fn start_all_in_one(&mut self) {
@@ -663,12 +758,18 @@ impl App {
             xray_path: self.xray_path.clone(),
             xray_http_listen: self.xray_http_listen.clone(),
             xray_socks_listen: Some(self.xray_socks_listen.clone()),
+            xray_tun_enabled: self.xray_tun_enabled,
             xray_log_level: self.xray_log_level.clone(),
+            logging_enabled: self.logging_enabled,
             light_mode: self.light_mode,
             scan_target: self.scan_target.clone(),
             scan_timeout_secs: self.scan_timeout_secs.clone(),
             scan_concurrency: self.scan_concurrency.clone(),
-            log_lines: self.log.snapshot(),
+            log_lines: if self.logging_enabled {
+                self.log.snapshot()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -725,11 +826,15 @@ impl App {
             self.status = "No Xray download URL for this platform".into();
             return;
         };
-        let dest_dir = std::env::temp_dir().join("sni-spoof-rs-xray");
+        let dest_dir = xray_data_dir();
         let (tx, rx) = std::sync::mpsc::channel();
         self.xray_rx = Some(rx);
-        self.status = "Downloading Xray...".into();
-        self.log.push(format!("downloading xray from {}", url));
+        self.status = format!("Downloading Xray to {}...", dest_dir.display());
+        self.log.push(format!(
+            "downloading xray from {} to {}",
+            url,
+            dest_dir.display()
+        ));
         std::thread::spawn(move || {
             let result = download_xray_to(&url, &dest_dir);
             let _ = tx.send(XrayMsg::Downloaded(result));
@@ -892,11 +997,17 @@ impl eframe::App for App {
         let palette = palette(self.light_mode);
         self.poll_scan();
         self.poll_xray();
+        self.poll_ip_check();
         if self.proxy.as_ref().is_some_and(|p| !p.is_running()) {
             self.proxy = None;
             self.status = "Proxy stopped".into();
+            self.reset_connection_status();
         }
-        if self.scan_rx.is_some() || self.xray_rx.is_some() || self.xray.is_some() {
+        if self.scan_rx.is_some()
+            || self.xray_rx.is_some()
+            || self.ip_check_rx.is_some()
+            || self.xray.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
 
@@ -938,6 +1049,8 @@ impl eframe::App for App {
                             palette.stopped_fill
                         },
                     );
+                    let (ip_text, ip_fill) = self.connection_status.pill(palette);
+                    status_pill(ui, &ip_text, ip_fill);
                     ui.separator();
                     ui.label(egui::RichText::new(&self.status).color(palette.muted));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1047,6 +1160,15 @@ impl App {
                     self.save_config();
                 }
                 if ui
+                    .add_enabled(
+                        self.xray.is_some() && self.ip_check_rx.is_none(),
+                        neutral_button("Check IP", palette),
+                    )
+                    .clicked()
+                {
+                    self.start_ip_check();
+                }
+                if ui
                     .add(neutral_button("Use connect as scan target", palette))
                     .clicked()
                 {
@@ -1154,6 +1276,17 @@ impl App {
                     {
                         self.bind_xray_lan();
                     }
+                    if ui
+                        .checkbox(&mut self.xray_tun_enabled, "Xray TUN mode")
+                        .changed()
+                    {
+                        self.status = if self.xray_tun_enabled {
+                            "Xray TUN mode enabled. Run elevated and avoid routing loops.".into()
+                        } else {
+                            "Xray TUN mode disabled".into()
+                        };
+                        self.save_state();
+                    }
                 });
 
                 let import_labels = share_lines(&self.import_text)
@@ -1196,6 +1329,15 @@ impl App {
                     }
                     if ui
                         .add_enabled(
+                            self.xray.is_some() && self.ip_check_rx.is_none(),
+                            neutral_button("Fetch my IP", palette),
+                        )
+                        .clicked()
+                    {
+                        self.start_ip_check();
+                    }
+                    if ui
+                        .add_enabled(
                             self.xray.is_none(),
                             filled_button("Start Xray", palette.primary_fill),
                         )
@@ -1210,8 +1352,11 @@ impl App {
                     }
                 });
                 ui.label(format!(
-                    "HTTP/HTTPS: {}    SOCKS5: {}",
-                    self.xray_http_listen, self.xray_socks_listen
+                    "HTTP/HTTPS: {}    SOCKS5: {}    TUN: {}    {}",
+                    self.xray_http_listen,
+                    self.xray_socks_listen,
+                    if self.xray_tun_enabled { "on" } else { "off" },
+                    self.connection_status.detail()
                 ));
             });
         });
@@ -1315,6 +1460,15 @@ impl App {
             ui.horizontal(|ui| {
                 section_header(ui, "Logs", egui::Color32::from_rgb(108, 117, 125), palette);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.checkbox(&mut self.logging_enabled, "Logging").changed() {
+                        self.log.set_enabled(self.logging_enabled);
+                        self.status = if self.logging_enabled {
+                            "Logging enabled".into()
+                        } else {
+                            "Logging disabled".into()
+                        };
+                        self.save_state();
+                    }
                     if ui.add(neutral_button("Clear", palette)).clicked() {
                         self.log.clear();
                         self.status = "Logs cleared".into();
@@ -1331,8 +1485,12 @@ impl App {
                 .stick_to_bottom(true)
                 .max_height((ui.available_height() - 4.0).max(80.0))
                 .show(ui, |ui| {
-                    for line in self.log.snapshot() {
-                        ui.monospace(line);
+                    if self.logging_enabled {
+                        for line in self.log.snapshot() {
+                            ui.monospace(line);
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("Logging is disabled").color(palette.muted));
                     }
                 });
         });
@@ -1348,7 +1506,11 @@ struct UiState {
     xray_http_listen: String,
     #[serde(default)]
     xray_socks_listen: Option<String>,
+    #[serde(default)]
+    xray_tun_enabled: bool,
     xray_log_level: String,
+    #[serde(default = "default_true")]
+    logging_enabled: bool,
     light_mode: bool,
     scan_target: String,
     scan_timeout_secs: String,
@@ -1361,6 +1523,10 @@ fn load_ui_state() -> Option<UiState> {
     let path = ui_state_path();
     let body = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&body).ok()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn ui_state_path() -> PathBuf {
@@ -1382,6 +1548,64 @@ fn log_export_path() -> PathBuf {
         .parent()
         .map(|dir| dir.join(&file_name))
         .unwrap_or_else(|| PathBuf::from(file_name))
+}
+
+fn app_data_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("SNI_SPOOF_UI_DATA_DIR") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = home_dir() {
+            return home
+                .join("Library")
+                .join("Application Support")
+                .join("sni-spoof-rs");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata).join("sni-spoof-rs");
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+            if !xdg_data.trim().is_empty() {
+                return PathBuf::from(xdg_data).join("sni-spoof-rs");
+            }
+        }
+        if let Some(home) = home_dir() {
+            return home.join(".local").join("share").join("sni-spoof-rs");
+        }
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join(".sni-spoof-rs")))
+        .unwrap_or_else(|| PathBuf::from(".sni-spoof-rs"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn xray_data_dir() -> PathBuf {
+    app_data_dir().join("xray").join(format!(
+        "{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ))
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -1412,6 +1636,38 @@ impl Drop for XrayRuntime {
 
 enum XrayMsg {
     Downloaded(Result<String, String>),
+}
+
+enum IpCheckMsg {
+    Checked(Result<String, String>),
+}
+
+#[derive(Clone)]
+enum ConnectionStatus {
+    Idle,
+    Checking,
+    Connected(String),
+    Failed(String),
+}
+
+impl ConnectionStatus {
+    fn pill(&self, palette: Palette) -> (String, egui::Color32) {
+        match self {
+            Self::Idle => ("IP unchecked".into(), palette.stopped_fill),
+            Self::Checking => ("Checking IP".into(), palette.primary_fill),
+            Self::Connected(ip) => (format!("IP {}", ip), palette.success_fill),
+            Self::Failed(_) => ("IP check failed".into(), palette.danger_fill),
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Idle => "IP: unchecked".into(),
+            Self::Checking => "IP: checking".into(),
+            Self::Connected(ip) => format!("IP: {}", ip),
+            Self::Failed(e) => format!("IP check failed: {}", e),
+        }
+    }
 }
 
 fn share_lines(text: &str) -> Vec<&str> {
@@ -1486,13 +1742,19 @@ fn default_xray_path() -> String {
         }
     }
 
+    let binary_name = if cfg!(windows) { "xray.exe" } else { "xray" };
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(if cfg!(windows) { "xray.exe" } else { "xray" }));
+            candidates.push(dir.join(binary_name));
         }
     }
-    candidates.push(std::env::temp_dir().join("sni-spoof-rs-xray").join("xray"));
+    candidates.push(xray_data_dir().join(binary_name));
+    candidates.push(
+        std::env::temp_dir()
+            .join("sni-spoof-rs-xray")
+            .join(binary_name),
+    );
     candidates.push(PathBuf::from("/opt/homebrew/bin/xray"));
     candidates.push(PathBuf::from("/usr/local/bin/xray"));
 
@@ -1539,19 +1801,11 @@ fn download_xray_to(url: &str, dest_dir: &Path) -> Result<String, String> {
     }
 
     let binary_name = if cfg!(windows) { "xray.exe" } else { "xray" };
-    let unzip_status = Command::new("unzip")
-        .arg("-o")
-        .arg(&zip_path)
-        .arg(binary_name)
-        .arg("-d")
-        .arg(dest_dir)
-        .status()
-        .map_err(|e| format!("failed to run unzip: {}", e))?;
-    if !unzip_status.success() {
-        return Err(format!("unzip exited with {}", unzip_status));
-    }
-
     let binary = dest_dir.join(binary_name);
+    let _ = std::fs::remove_file(&binary);
+    extract_xray_zip(&zip_path, binary_name, dest_dir)?;
+    let _ = std::fs::remove_file(&zip_path);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1563,6 +1817,113 @@ fn download_xray_to(url: &str, dest_dir: &Path) -> Result<String, String> {
     }
 
     Ok(binary.to_string_lossy().to_string())
+}
+
+#[cfg(not(windows))]
+fn extract_xray_zip(zip_path: &Path, binary_name: &str, dest_dir: &Path) -> Result<(), String> {
+    let unzip_status = Command::new("unzip")
+        .arg("-o")
+        .arg(zip_path)
+        .arg(binary_name)
+        .arg("-d")
+        .arg(dest_dir)
+        .status()
+        .map_err(|e| format!("failed to run unzip: {}", e))?;
+    if !unzip_status.success() {
+        return Err(format!("unzip exited with {}", unzip_status));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn extract_xray_zip(zip_path: &Path, binary_name: &str, dest_dir: &Path) -> Result<(), String> {
+    let status = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg("Expand-Archive -Force -LiteralPath $args[0] -DestinationPath $args[1]")
+        .arg(zip_path)
+        .arg(dest_dir)
+        .status()
+        .map_err(|e| format!("failed to run powershell Expand-Archive: {}", e))?;
+    if !status.success() {
+        return Err(format!("Expand-Archive exited with {}", status));
+    }
+    if !dest_dir.join(binary_name).exists() {
+        return Err(format!("{} was not found in Xray archive", binary_name));
+    }
+    Ok(())
+}
+
+fn connection_check_proxy_url(http_listen: &str, socks_listen: &str) -> Result<String, String> {
+    if let Some(addr) = parse_optional_socket("Xray HTTP/HTTPS proxy", http_listen)? {
+        return Ok(format!("http://{}", local_check_addr(addr)));
+    }
+    if let Some(addr) = parse_optional_socket("Xray SOCKS5 proxy", socks_listen)? {
+        return Ok(format!("socks5h://{}", local_check_addr(addr)));
+    }
+    Err("enable an Xray HTTP/HTTPS or SOCKS5 proxy before checking IP".into())
+}
+
+fn local_check_addr(addr: SocketAddr) -> String {
+    let ip = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    match ip {
+        IpAddr::V4(ip) => format!("{}:{}", ip, addr.port()),
+        IpAddr::V6(ip) => format!("[{}]:{}", ip, addr.port()),
+    }
+}
+
+fn fetch_public_ip_through_proxy(proxy_url: &str) -> Result<String, String> {
+    let endpoints = [
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://ifconfig.me/ip",
+    ];
+    let mut last_error = String::new();
+    for endpoint in endpoints {
+        match fetch_public_ip_once(proxy_url, endpoint) {
+            Ok(ip) => return Ok(ip),
+            Err(e) => last_error = e,
+        }
+    }
+    if last_error.is_empty() {
+        last_error = "no IP endpoints were configured".into();
+    }
+    Err(last_error)
+}
+
+fn fetch_public_ip_once(proxy_url: &str, endpoint: &str) -> Result<String, String> {
+    let output = Command::new("curl")
+        .arg("-fsSL")
+        .arg("--max-time")
+        .arg("12")
+        .arg("--connect-timeout")
+        .arg("6")
+        .arg("--proxy")
+        .arg(proxy_url)
+        .arg(endpoint)
+        .output()
+        .map_err(|e| format!("failed to run curl: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("curl exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let first = body.split_whitespace().next().unwrap_or_default();
+    first
+        .parse::<IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| format!("{} returned unexpected response: {}", endpoint, body))
 }
 
 fn spawn_output_reader<R>(reader: R, log: UiLog, prefix: &'static str)
@@ -1585,6 +1946,7 @@ fn build_xray_config(
     sni_listener: &str,
     http_listen: &str,
     socks_listen: &str,
+    tun_enabled: bool,
     log_level: &str,
 ) -> Result<String, String> {
     if !matches!(share.protocol.as_str(), "vless" | "trojan") {
@@ -1602,7 +1964,7 @@ fn build_xray_config(
         .map_err(|e| format!("invalid SNI listener address: {}", e))?;
     let http_addr = parse_optional_socket("Xray HTTP/HTTPS proxy", http_listen)?;
     let socks_addr = parse_optional_socket("Xray SOCKS5 proxy", socks_listen)?;
-    if http_addr.is_none() && socks_addr.is_none() {
+    if http_addr.is_none() && socks_addr.is_none() && !tun_enabled {
         return Err("enable at least one Xray inbound proxy address".into());
     }
 
@@ -1712,6 +2074,25 @@ fn build_xray_config(
             }
         }));
     }
+    if tun_enabled {
+        inbounds.push(json!({
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {
+                "name": "sni-spoof-rs-tun",
+                "mtu": 1500,
+                "gateway": ["10.250.0.1/16", "fc00:250::1/64"],
+                "dns": ["1.1.1.1", "8.8.8.8"],
+                "userLevel": 0,
+                "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
+                "autoOutboundsInterface": "auto"
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"]
+            }
+        }));
+    }
 
     let config = json!({
         "log": {
@@ -1768,6 +2149,7 @@ mod tests {
             "127.0.0.1:40443",
             "127.0.0.1:1080",
             "127.0.0.1:1081",
+            false,
             "warning",
         )
         .unwrap();
@@ -1801,6 +2183,7 @@ mod tests {
             "127.0.0.1:40443",
             "0.0.0.0:1080",
             "0.0.0.0:1081",
+            false,
             "warning",
         )
         .unwrap();
@@ -1826,9 +2209,35 @@ mod tests {
     fn rejects_xray_config_without_any_inbound_proxy() {
         let share = xray::parse_share_link("trojan://humanity@example.com:443?security=tls")
             .expect("parse share");
-        let err = build_xray_config(&share, "127.0.0.1:40443", "", "", "warning")
+        let err = build_xray_config(&share, "127.0.0.1:40443", "", "", false, "warning")
             .expect_err("missing inbounds should fail");
         assert!(err.contains("enable at least one Xray inbound"));
+    }
+
+    #[test]
+    fn builds_xray_config_with_tun_inbound() {
+        let share = xray::parse_share_link("trojan://humanity@example.com:443?security=tls")
+            .expect("parse share");
+        let body = build_xray_config(&share, "127.0.0.1:40443", "", "", true, "warning")
+            .expect("tun-only config should be valid");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["inbounds"][0]["protocol"], "tun");
+        assert_eq!(
+            value["inbounds"][0]["settings"]["autoOutboundsInterface"],
+            "auto"
+        );
+    }
+
+    #[test]
+    fn rewrites_unspecified_proxy_for_local_ip_check() {
+        assert_eq!(
+            connection_check_proxy_url("0.0.0.0:1080", "0.0.0.0:1081").unwrap(),
+            "http://127.0.0.1:1080"
+        );
+        assert_eq!(
+            connection_check_proxy_url("", "0.0.0.0:1081").unwrap(),
+            "socks5h://127.0.0.1:1081"
+        );
     }
 
     #[test]

@@ -21,22 +21,27 @@ jobs:
             os: ubuntu-latest
             name: sni-spoof-rs-linux-amd64
             ui_name: sni-spoof-rs-ui-linux-amd64
+            xray_asset: Xray-linux-64.zip
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             name: sni-spoof-rs-linux-arm64
             ui_name: ""
+            xray_asset: ""
           - target: x86_64-apple-darwin
             os: macos-latest
             name: sni-spoof-rs-macos-amd64
             ui_name: sni-spoof-rs-ui-macos-amd64
+            xray_asset: Xray-macos-64.zip
           - target: aarch64-apple-darwin
             os: macos-latest
             name: sni-spoof-rs-macos-arm64
             ui_name: sni-spoof-rs-ui-macos-arm64
+            xray_asset: Xray-macos-arm64-v8a.zip
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: sni-spoof-rs-windows-amd64
             ui_name: sni-spoof-rs-ui-windows-amd64
+            xray_asset: Xray-windows-64.zip
 
     runs-on: ${{ matrix.os }}
 
@@ -98,6 +103,15 @@ jobs:
           if [ -n "${{ matrix.ui_name }}" ]; then
             cp target/${{ matrix.target }}/release/sni-spoof-rs-ui dist/${{ matrix.ui_name }}
             chmod +x dist/${{ matrix.ui_name }}
+            curl -fsSL "https://github.com/XTLS/Xray-core/releases/latest/download/${{ matrix.xray_asset }}" -o xray.zip
+            mkdir -p xray-extracted
+            unzip -o xray.zip xray -d xray-extracted
+            chmod +x xray-extracted/xray
+            bundle_dir="bundle-${{ matrix.ui_name }}"
+            mkdir -p "${bundle_dir}"
+            cp dist/${{ matrix.ui_name }} "${bundle_dir}/"
+            cp xray-extracted/xray "${bundle_dir}/"
+            tar -C "${bundle_dir}" -czf dist/${{ matrix.ui_name }}-bundle.tar.gz .
           fi
 
       - name: Package (windows)
@@ -119,6 +133,13 @@ jobs:
             Copy-Item windivert-extracted/WinDivert-2.2.2-A/x64/WinDivert.dll dist/${{ matrix.name }}/
             Copy-Item windivert-extracted/WinDivert-2.2.2-A/x64/WinDivert64.sys dist/${{ matrix.name }}/
           }
+          Invoke-WebRequest -Uri "https://github.com/XTLS/Xray-core/releases/latest/download/${{ matrix.xray_asset }}" -OutFile xray.zip
+          Expand-Archive xray.zip -DestinationPath xray-extracted -Force
+          $xrayFile = Get-ChildItem -Recurse -Path xray-extracted -Filter "xray.exe" | Select-Object -First 1
+          if (-not $xrayFile) {
+            throw "xray.exe not found in Xray archive"
+          }
+          Copy-Item $xrayFile.FullName dist/${{ matrix.name }}/
           Compress-Archive -Path dist/${{ matrix.name }}/* -DestinationPath dist/${{ matrix.name }}.zip
 
       - uses: actions/upload-artifact@v7
@@ -160,6 +181,9 @@ jobs:
           cp dist/sni-spoof-rs-ui-linux-amd64 releases/ || true
           cp dist/sni-spoof-rs-ui-macos-amd64 releases/ || true
           cp dist/sni-spoof-rs-ui-macos-arm64 releases/ || true
+          cp dist/sni-spoof-rs-ui-linux-amd64-bundle.tar.gz releases/ || true
+          cp dist/sni-spoof-rs-ui-macos-amd64-bundle.tar.gz releases/ || true
+          cp dist/sni-spoof-rs-ui-macos-arm64-bundle.tar.gz releases/ || true
           chmod +x releases/sni-spoof-rs-linux-* releases/sni-spoof-rs-macos-*
           chmod +x releases/sni-spoof-rs-ui-* || true
           TAG="${GITHUB_REF#refs/tags/}"
