@@ -142,7 +142,7 @@ fn get_interface_for(ip: IpAddr) -> Result<(String, i32), SnifferError> {
     for ifaddr in addrs {
         if let Some(addr) = ifaddr.address {
             let matches = match (addr.as_sockaddr_in(), addr.as_sockaddr_in6()) {
-                (Some(v4), _) => IpAddr::V4(v4.ip().into()) == local_ip,
+                (Some(v4), _) => IpAddr::V4(v4.ip()) == local_ip,
                 (_, Some(v6)) => IpAddr::V6(v6.ip()) == local_ip,
                 _ => false,
             };
